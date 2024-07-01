@@ -252,6 +252,7 @@ const styles = StyleSheet.create({
     paddingVertical: 20,
   },
   container: {
+    width: "90%",
     flex: 1,
     alignItems: 'center',
     backgroundColor: '#ffffff',
