@@ -1,72 +1,130 @@
 import React, { useState } from 'react';
-import { StyleSheet, TouchableOpacity, Image, KeyboardAvoidingView, Platform, SafeAreaView, ScrollView } from 'react-native';
+import { StyleSheet, TouchableOpacity, Image, KeyboardAvoidingView, Platform, SafeAreaView, ScrollView, ActivityIndicator } from 'react-native';
 import { Text, View } from '@/components/Themed';
 import { useTensorflowModel } from 'react-native-fast-tflite';
+import { launchCamera } from 'react-native-image-picker';
 import ImageResizer from 'react-native-image-resizer';
 import RNFS from 'react-native-fs';
-import { convertToRGB } from 'react-native-image-to-rgb';
 import { Buffer } from 'buffer';
 import jpeg from 'jpeg-js';
+import { convertToRGB } from 'react-native-image-to-rgb';
 
 // Ensure Buffer is available globally
 global.Buffer = Buffer;
 
-const localImage =     {
-  props: {
-    source: require("../../assets/images/linkedinphoto.jpeg")
-  }
-}
-
 export default function TabOneScreen() {
   const objectDetection = useTensorflowModel(require('../../assets/models/aging_gan_generator.tflite'));
   const model = objectDetection.state === 'loaded' ? objectDetection.model : undefined;
+  const [photoUri, setPhotoUri] = useState<string | null>(null);
   const [resizedPhotoUri, setResizedPhotoUri] = useState<string | null>(null);
   const [outputUri, setOutputUri] = useState<string | null>(null);
+  const [loading, setLoading] = useState<boolean>(false);
 
-  // Function to determine the dimensions of a multi-dimensional array
-function getArrayDimensions(arr: any) {
-  if (!Array.isArray(arr)) return [];
-  const dimensions = [];
+  const takePicture = async () => {
+    const result = await launchCamera({
+      mediaType: 'photo',
+      includeBase64: true,
+      maxHeight: 1024,
+      maxWidth: 1024,
+    });
 
-  while (Array.isArray(arr)) {
-    dimensions.push(arr.length);
-    arr = arr[0];
-  }
-
-  return dimensions;
-}
-
-  const processImage = async () => {
-    if (model) {
-      // Resize and preprocess the image
-      const asset = Image.resolveAssetSource(localImage.props.source);
-      const uri = asset.uri;
-      console.log(localImage)
-      const resizedUri = await resizeImage(uri, 512, 512);
-      const inputTensor = await preprocessImage(resizedUri);
-      console.log('Input Tensor Dimensions:', getArrayDimensions([inputTensor]));
-      const outputDict = model.runSync([inputTensor]);
-
-      // Access the output using the specific key 'output'
-      const outputTensor = outputDict[0];
-      const reshapedOutput = reshapeOutput(new Float32Array(outputTensor));
-
-      // Transform the output
-      const transformedOutput = transformOutput(reshapedOutput);
-
-      // Postprocess the model output to create an image
-      const outputUri = await postprocessOutput(transformedOutput);
-      setOutputUri(outputUri);
+    if (result.assets && result.assets.length > 0) {
+      const photo = result.assets[0];
+      if (photo.uri) {
+        setPhotoUri(photo.uri);
+        processImage(photo.uri);
+      }
     }
   };
 
-  const resizeImage = async (uri: string, width: number, height: number) => {
-    const resizedImage = await ImageResizer.createResizedImage(uri, width, height, 'PNG', 100);
-    setResizedPhotoUri(resizedImage.uri);
-    return resizedImage.uri;
+  const processImage = async (uri: string) => {
+    if (model) {
+      setOutputUri(null)
+      setPhotoUri(null)
+      setResizedPhotoUri(null)
+      setLoading(true);
+      try {
+        console.log('Starting image processing...');
+        const resizedUri = await resizeAndCropImage(uri, 512, 512);
+        const inputTensor = await preprocessImage(resizedUri);
+        console.log('Input Tensor Dimensions:', [1, 3, 512, 512]);
+        const outputDict = model.runSync([inputTensor]);
+
+        const outputTensor = outputDict[0];
+        const reshapedOutput = reshapeOutput(new Float32Array(outputTensor));
+
+        const transformedOutput = transformOutput(reshapedOutput);
+
+        const outputUri = await postprocessOutput(transformedOutput);
+        setOutputUri(outputUri);
+        console.log('Image processing completed.');
+      } catch (error) {
+        console.error('Error processing image:', error);
+      } finally {
+        setLoading(false);
+      }
+    }
+  };
+
+  const resizeAndCropImage = async (uri: string, targetWidth: number, targetHeight: number) => {
+    const resizedImage = await ImageResizer.createResizedImage(uri, targetWidth, targetHeight, 'JPEG', 100, 0, undefined, false, {
+      mode: 'cover',
+    });
+    const { uri: resizedUri } = resizedImage;
+  
+    // Load the resized image
+    const imageData = await RNFS.readFile(resizedUri, 'base64');
+    const buffer = Buffer.from(imageData, 'base64');
+    const rawImageData = jpeg.decode(buffer, { useTArray: true });
+  
+    const { width, height, data } = rawImageData;
+  
+    if (width !== targetWidth) {
+      throw new Error('Width of resized image does not match target width.');
+    }
+  
+    let startY = 0;
+    let endY = height;
+  
+    if (height > targetHeight) {
+      const excessHeight = height - targetHeight;
+      startY = excessHeight / 2;
+      endY = startY + targetHeight;
+    }
+  
+    const croppedData = [];
+    for (let y = startY; y < endY; y++) {
+      for (let x = 0; x < width; x++) {
+        const index = (Math.floor(y) * width + x) * 4;
+        croppedData.push(data[index], data[index + 1], data[index + 2], data[index + 3]);
+      }
+    }
+  
+    const frameData = {
+      data: new Uint8Array(croppedData),
+      width: targetWidth,
+      height: targetHeight,
+    };
+  
+    const croppedImageData = jpeg.encode(frameData, 100);
+    const croppedPath = `${RNFS.DocumentDirectoryPath}/cropped.jpg`;
+    await RNFS.writeFile(croppedPath, croppedImageData.data.toString('base64'), 'base64');
+  
+    setResizedPhotoUri(croppedPath);
+    return croppedPath;
   };
 
   const preprocessImage = async (uri: string) => {
+    const imageData = await RNFS.readFile(uri, 'base64');
+    const buffer = Buffer.from(imageData, 'base64');
+    const rawImageData = jpeg.decode(buffer, { useTArray: true });
+
+    const { width, height, data } = rawImageData;
+
+    if (width !== 512 || height !== 512) {
+      throw new Error('Image dimensions must be 512x512');
+    }
+
     const convertedArray = await convertToRGB(uri);
 
     const float32Array = new Float32Array(512 * 512 * 3);
@@ -121,15 +179,14 @@ function getArrayDimensions(arr: any) {
   };
 
   const postprocessOutput = async (output: Float32Array) => {
-    // Convert the normalized output to uint8 array
+    const width = 512;
+    const height = 512;
     const uint8Array = new Uint8Array(output.length);
+
     for (let i = 0; i < output.length; i++) {
       uint8Array[i] = Math.min(255, Math.max(0, output[i] * 255));
     }
 
-    // Convert to RGB format expected by jpeg-js
-    const width = 512;
-    const height = 512;
     const frameData = {
       data: new Uint8Array(width * height * 4),
       width: width,
@@ -143,7 +200,7 @@ function getArrayDimensions(arr: any) {
       frameData.data[j + 3] = 255;             // A (fully opaque)
     }
 
-    const jpegImageData = jpeg.encode(frameData, 90); // 90 is the quality of the output image
+    const jpegImageData = jpeg.encode(frameData, 90);
 
     const outputPath = `${RNFS.DocumentDirectoryPath}/output.jpg`;
     await RNFS.writeFile(outputPath, jpegImageData.data.toString('base64'), 'base64');
@@ -158,9 +215,15 @@ function getArrayDimensions(arr: any) {
           <Text style={styles.title}>iFaceAging</Text>
           <View style={styles.separator} lightColor="#eee" darkColor="rgba(255,255,255,0.1)" />
 
-          <TouchableOpacity style={styles.button} onPress={processImage}>
-            <Text style={styles.buttonText}>Process Predefined Image</Text>
+          <TouchableOpacity style={styles.button} onPress={takePicture}>
+            <Text style={styles.buttonText}>Take Picture</Text>
           </TouchableOpacity>
+
+          {loading && <ActivityIndicator size="large" color="#007bff" style={styles.loading} />}
+
+          {photoUri && (
+            <Image source={{ uri: photoUri }} style={styles.photo} />
+          )}
 
           {resizedPhotoUri && (
             <Image source={{ uri: resizedPhotoUri }} style={styles.photo} />
@@ -180,7 +243,7 @@ function getArrayDimensions(arr: any) {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#f5f5f5',
+    backgroundColor: '#f0f0f0',
   },
   scrollContainer: {
     flexGrow: 1,
@@ -191,13 +254,23 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     alignItems: 'center',
-    backgroundColor: '#f5f5f5',
+    backgroundColor: '#ffffff',
+    padding: 20,
+    borderRadius: 10,
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    elevation: 5,
   },
   title: {
-    fontSize: 24,
+    fontSize: 26,
     fontWeight: 'bold',
     color: '#333',
-    marginTop: 20,
+    marginVertical: 20,
     textAlign: 'center',
   },
   separator: {
@@ -210,21 +283,34 @@ const styles = StyleSheet.create({
   button: {
     backgroundColor: '#007bff',
     paddingVertical: 15,
-    paddingHorizontal: 20,
-    borderRadius: 8,
+    paddingHorizontal: 30,
+    borderRadius: 25,
     alignSelf: 'center',
     marginVertical: 20,
+    shadowColor: '#007bff',
+    shadowOffset: {
+      width: 0,
+      height: 10,
+    },
+    shadowOpacity: 0.3,
+    shadowRadius: 13.16,
+    elevation: 20,
   },
   buttonText: {
     color: '#fff',
     fontSize: 18,
     fontWeight: 'bold',
+    textTransform: 'uppercase',
+  },
+  loading: {
+    marginVertical: 20,
   },
   photo: {
-    width: 200,
-    height: 200,
+    width: 300,
+    height: 300,
     alignSelf: 'center',
     marginVertical: 20,
+    borderRadius: 10,
   },
   inputContainer: {
     flexDirection: 'row',
@@ -235,3 +321,4 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
   },
 });
+
